@@ -114,7 +114,6 @@ def summary = [:]
 summary['Pipeline Name']  = workflow.manifest.name
 summary['Pipeline Version'] = workflow.manifest.version
 summary['Run Name']     = custom_runName ?: workflow.runName
-// TODO nf-core: Report custom parameters here
 summary['Reads']        = params.reads
 summary['Ref FASTAs'] = params.refs
 if(params.bedfile) {
@@ -150,13 +149,14 @@ process SNIPPY {
   publishDir "${params.outdir}/snippy/", pattern: "${sample}-VS-${ref_name}", mode: 'copy'
 
   input:
-    tuple sample,
+    tuple val(sample),
           path(reads),
           path(ref)
   output:
-    tuple sample,
+    tuple val(sample),
           path(ref),
-          path("${sample}-VS-${ref_name}/")
+          path("${sample}-VS-${ref_name}/"),
+          emit: snippy_out
 
   script:
   ref_name = file(ref).getBaseName()
@@ -184,8 +184,12 @@ process MAP_STATS {
     tuple val(sample),
           path(ref_fasta),
           path(snippy_outdir),
-          path(depths), emit: depths
-    tuple path('*.flagstat'), path('*.idxstats'), emit: other_stats
+          path(depths),
+          emit: depths
+    tuple path('*.flagstat'),
+          path('*.idxstats'),
+          emit: other_stats
+
   script:
   ref_name = ref_fasta.getBaseName()
   depths = "${sample}-VS-${ref_name}-depths.tsv"
@@ -200,7 +204,7 @@ process MAP_STATS {
 }
 
 // Filter for ALT allele variants that have greater depth than REF and
-// that have greater than 2X coverage 
+// that have greater than 2X coverage
 process BCF_FILTER {
   tag "$sample - $ref_name"
   publishDir "${params.outdir}/variants",
@@ -221,7 +225,9 @@ process BCF_FILTER {
           path(ref_fasta),
           path(snippy_outdir),
           path(depths),
-          path(filt_vcf)
+          path(filt_vcf),
+          emit: variants
+
   script:
   ref_name = ref_fasta.getBaseName()
   vcf = "${snippy_outdir}/${sample}.raw.vcf"
@@ -237,7 +243,7 @@ process BCF_FILTER {
 
 process CONSENSUS {
   tag "$sample - $ref_name"
-  publishDir "${params.outdir}/consensus", 
+  publishDir "${params.outdir}/consensus",
     pattern: "*.consensus.fasta",
     mode: 'copy'
 
@@ -252,7 +258,8 @@ process CONSENSUS {
           path(ref_fasta),
           path(snippy_outdir),
           path(depths),
-          path(consensus)
+          path(consensus),
+          emit: consensus
 
   script:
   ref_name = ref_fasta.getBaseName()
@@ -272,19 +279,20 @@ process CONSENSUS {
 }
 
 process COVERAGE_PLOT {
-  publishDir "${params.outdir}/plots", 
+  tag "$sample - $ref_name"
+  publishDir "${params.outdir}/plots",
     pattern: '*.pdf',
     mode: 'copy'
 
   input:
-  tuple val(sample),
-        path(ref_fasta),
-        path(snippy_outdir),
-        path(depths),
-        path(filt_vcf)
-  
+    tuple val(sample),
+          path(ref_fasta),
+          path(snippy_outdir),
+          path(depths),
+          path(filt_vcf)
+
   output:
-  path("*.pdf")
+    path("*.pdf")
 
   script:
   ref_name = ref_fasta.getBaseName()
@@ -306,36 +314,41 @@ workflow {
   Channel.fromPath( params.refs )
     .set { ch_refs }
 
-  // Map each sample's reads against each reference genome sequence
-  // - Combine each ref seq with each sample's reads
-  // - map reads against ref
+  // Build reads channel depending on single vs paired end
   if (params.single_end) {
     Channel.fromPath(params.reads)
       .map { [file(it).getBaseName(), it] }
       .set { ch_reads }
   } else {
-    ch_reads = Channel.fromFilePairs(
+    Channel.fromFilePairs(
         params.reads,
         checkIfExists: true)
-      .ifEmpty { exit 1, "No reads specified! Please specify where your reads are, e.g. '--reads \"/path/to/reads/*R{1,2}*.fastq.gz\"' (quotes around reads path required if using `*` and other characters expanded by the shell!)"}
+      .ifEmpty { exit 1, "No reads specified! Please specify where your reads are, e.g. '--reads \"/path/to/reads/*R{1,2}*.fastq.gz\"' (quotes around reads path required if using `*` and other characters expanded by the shell!)" }
       .map { [ it[0].replaceAll(/_S\d{1,2}_L001/, ""), it[1] ] }
+      .set { ch_reads }
   }
-  ch_reads | combine(ch_refs) | SNIPPY | MAP_STATS
 
-  MAP_STATS.out.depths \
-    | filter { 
-      // Filter for alignments that did have some reads mapping to the ref genome
-      depth_linecount = file(it[3]).readLines().size()
-      if (depth_linecount == 1) {
-        println "No reads from \"${it[0]}\" mapped to reference ${it[1]}"
+  // Map reads against each reference genome
+  ch_reads
+    | combine(ch_refs)
+    | SNIPPY
+    | MAP_STATS
+
+  // Filter out samples with no mapped reads, then call variants and consensus
+  MAP_STATS.out.depths
+    | filter {
+        depth_linecount = file(it[3]).readLines().size()
+        if (depth_linecount == 1) {
+          println "No reads from \"${it[0]}\" mapped to reference ${it[1]}"
+        }
+        depth_linecount > 2
       }
-      depth_linecount > 2
-    } \
-    | BCF_FILTER \
+    | BCF_FILTER
     | CONSENSUS
 
-  COVERAGE_PLOT(BCF_FILTER.out)
-  
+  // Coverage plots use BCF_FILTER output (before consensus)
+  COVERAGE_PLOT(BCF_FILTER.out.variants)
+
 }
 
 //=============================================================================
